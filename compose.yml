@@ -1,16 +1,17 @@
 services:
   relay:
-    image: agentchannels-relay:local
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/agentchannels/agentchannels-relay:1.0.0
     environment:
       AGENTCHANNELS_RELAY_BIND: 0.0.0.0:8787
       AGENTCHANNELS_RELAY_DATABASE: /var/lib/agentchannels-relay/agentchannels-relay.db
+      AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN_FILE: /run/secrets/relay_enrollment_token
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
       - relay-data:/var/lib/agentchannels-relay
+    secrets:
+      - relay_enrollment_token
+    user: "10001:10001"
     read_only: true
     restart: unless-stopped
     cap_drop:
@@ -20,3 +21,7 @@ services:
 
 volumes:
   relay-data:
+
+secrets:
+  relay_enrollment_token:
+    file: ./secrets/relay-enrollment-token
