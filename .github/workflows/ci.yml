@@ -53,8 +53,13 @@ jobs:
         run: |
           set -euo pipefail
           enrollment_file="secrets/relay-enrollment-token"
+          mkdir -p secrets
+          chmod 700 secrets
           printf 'ci-enrollment-token\n' > "$enrollment_file"
-          chmod 600 "$enrollment_file"
+          chmod 644 "$enrollment_file"
+          test "$(stat -c '%a' secrets)" = 700
+          test "$(stat -c '%a' "$enrollment_file")" = 644
+          sudo -u nobody test ! -r "$enrollment_file"
 
       - name: Validate both Compose paths
         run: |
@@ -73,6 +78,7 @@ jobs:
               fi
               sleep 1
             done
+            docker compose -f compose.yml -f compose.build.yml logs relay >&2 || true
             return 1
           }
 
@@ -103,7 +109,7 @@ jobs:
           relay_container=$(docker compose -f compose.yml -f compose.build.yml ps -q relay)
           docker inspect "$relay_container" --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}' | grep -F '10001:10001 true ["ALL"] ["no-new-privileges:true"]'
           docker compose -f compose.yml -f compose.build.yml exec -T relay sh -eu -c \
-            'test "$(id -u)" = 10001; test "$(id -g)" = 10001; test -f /var/lib/agentchannels-relay/agentchannels-relay.db; test -d /var/lib/agentchannels-relay/backups'
+            'test "$(id -u)" = 10001; test "$(id -g)" = 10001; test -r /run/secrets/relay_enrollment_token; test -f /var/lib/agentchannels-relay/agentchannels-relay.db; test -d /var/lib/agentchannels-relay/backups'
 
           docker compose -f compose.yml -f compose.build.yml stop relay
           docker compose -f compose.yml -f compose.build.yml rm -f relay

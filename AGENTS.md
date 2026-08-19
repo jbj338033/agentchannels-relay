@@ -56,11 +56,12 @@ Enrollment startup requires exactly one of `AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN
 policy as `/run/secrets/relay_enrollment_token`; edge rate limiting remains a
 deployment concern for public installations.
 
-Compose uses `./secrets/relay-enrollment-token` as its enrollment secret file;
-copy the example file there and replace it with an operator-controlled value
-before starting a production instance. Migration backups are restored
-only by an operator after preserving the current database and explicitly
-acknowledging post-backup data loss; the Relay has no down-migration path.
+Compose mounts `./secrets/relay-enrollment-token` read-only. Keep the `secrets`
+directory at mode `0700` to make it operator-only and the token file at `0644`
+so UID/GID 10001 can read the bind mount; generate a strong token there before
+starting a production instance. Migration backups are restored only by an
+operator after preserving the current database and explicitly acknowledging
+post-backup data loss; the Relay has no down-migration path.
 
 ## Change-specific verification
 

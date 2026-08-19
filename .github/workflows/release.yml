@@ -166,8 +166,13 @@ jobs:
           set -euo pipefail
           export COMPOSE_PROJECT_NAME="relay-release-${GITHUB_RUN_ID}"
           enrollment_file="secrets/relay-enrollment-token"
+          mkdir -p secrets
+          chmod 700 secrets
           printf 'release-compose-token\n' > "$enrollment_file"
-          chmod 600 "$enrollment_file"
+          chmod 644 "$enrollment_file"
+          test "$(stat -c '%a' secrets)" = 700
+          test "$(stat -c '%a' "$enrollment_file")" = 644
+          sudo -u nobody test ! -r "$enrollment_file"
           cleanup() {
             docker compose -f compose.yml -f compose.build.yml down --volumes >/dev/null 2>&1 || true
             rm -f "$enrollment_file"
@@ -178,6 +183,7 @@ jobs:
               curl --silent --output /dev/null http://127.0.0.1:8787/ && return
               sleep 1
             done
+            docker compose -f compose.yml -f compose.build.yml logs relay >&2 || true
             return 1
           }
 
@@ -195,7 +201,7 @@ jobs:
             --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}' \
             | grep -F '10001:10001 true ["ALL"] ["no-new-privileges:true"]'
           docker compose -f compose.yml exec -T relay sh -eu -c \
-            'test -f /var/lib/agentchannels-relay/agentchannels-relay.db; test -d /var/lib/agentchannels-relay/backups'
+            'test -r /run/secrets/relay_enrollment_token; test -f /var/lib/agentchannels-relay/agentchannels-relay.db; test -d /var/lib/agentchannels-relay/backups'
           python3 scripts/probe-unsupported-protocol.py
           docker compose -f compose.yml stop relay
           docker compose -f compose.yml rm -f relay

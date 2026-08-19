@@ -11,6 +11,9 @@ cargo run --release --locked
 From a source checkout, run with Docker Compose:
 
 ```sh
+install -d -m 700 secrets
+openssl rand -hex 32 > secrets/relay-enrollment-token
+chmod 644 secrets/relay-enrollment-token
 docker compose -f compose.yml -f compose.build.yml up --build -d
 docker compose logs -f
 docker compose down
@@ -21,7 +24,7 @@ docker compose down
 - `AGENTCHANNELS_RELAY_BIND` sets the HTTP and WebSocket listen address. Default: `127.0.0.1:8787`.
 - `AGENTCHANNELS_RELAY_DATABASE` sets the SQLite database path. Default: `agentchannels-relay.db`.
 - Exactly one enrollment policy is required: `AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN`, `AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN_FILE`, or `AGENTCHANNELS_RELAY_ALLOW_OPEN_ENROLLMENT=true`. The file policy is the production Compose path; open enrollment is for controlled development only.
-- Compose reads `./secrets/relay-enrollment-token`. Copy `secrets/relay-enrollment-token.example` to that path, replace its contents with an operator-controlled token, and keep the file out of version control.
+- Compose mounts `./secrets/relay-enrollment-token` read-only. Keep the `secrets` directory at mode `0700` so other host users cannot traverse it, and the token file at `0644` so the fixed non-root container user can read the bind mount. Generate a strong operator-controlled token at that ignored path before starting Compose.
 - Persistent migrations create a SQLite-backup artifact under `/var/lib/agentchannels-relay/backups` (or beside a development database) before changing schema. Backups are operator-only and are never automatically pruned.
 
 When binding beyond loopback, place the relay behind TLS, edge rate limiting, and an authenticated installation-enrollment boundary. The binary does not terminate public TLS.
