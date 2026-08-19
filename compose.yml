@@ -1,0 +1,22 @@
+services:
+  relay:
+    image: agentchannels-relay:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      AGENTCHANNELS_RELAY_BIND: 0.0.0.0:8787
+      AGENTCHANNELS_RELAY_DATABASE: /var/lib/agentchannels-relay/agentchannels-relay.db
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - relay-data:/var/lib/agentchannels-relay
+    read_only: true
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  relay-data:
