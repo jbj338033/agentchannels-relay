@@ -34,19 +34,37 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Verify enrollment and migration policy gates
+        run: |
+          cargo test --locked explicit_open_enrollment_accepts_a_valid_key
+          cargo test --locked protected_enrollment_has_identical_unauthorized_response
+          cargo test --locked open_enrollment_prunes_inactive_records_and_enforces_capacity
+          cargo test --locked legacy_schema_migration_creates_backup_and_preserves_data
+          cargo test --locked newer_schema_is_refused_without_mutation
+          cargo test --locked conformance_fixture_declares_protocol_one_and_explicit_rejection
+
       - name: Build release binary
         run: cargo build --release --locked
 
       - name: Build container image
         run: docker build --pull -t agentchannels-relay:test .
 
-      - name: Validate Compose configuration
-        run: docker compose config --quiet
+      - name: Prepare protected enrollment fixture
+        run: |
+          set -euo pipefail
+          enrollment_file="secrets/relay-enrollment-token"
+          printf 'ci-enrollment-token\n' > "$enrollment_file"
+          chmod 600 "$enrollment_file"
+
+      - name: Validate both Compose paths
+        run: |
+          docker compose -f compose.yml config --quiet
+          docker compose -f compose.yml -f compose.build.yml config --quiet
 
       - name: Verify Compose runtime and persistence
         run: |
           set -euo pipefail
-          trap 'docker compose down --volumes' EXIT
+          trap 'docker compose -f compose.yml -f compose.build.yml down --volumes; docker rm -f relay-direct relay-open 2>/dev/null || true; rm -f secrets/relay-enrollment-token' EXIT
 
           wait_for_relay() {
             for _ in $(seq 1 30); do
@@ -58,25 +76,71 @@ jobs:
             return 1
           }
 
-          docker compose up --build -d
+          docker compose -f compose.yml -f compose.build.yml up --build -d
           wait_for_relay
 
           relay_http_status=$(curl --silent --output /tmp/relay-response \
             --write-out '%{http_code}' \
             --request POST \
             --header 'content-type: application/json' \
-            --data '{' \
+            --data '{"installationId":"ci","publicKeyBase64":"cEmbmOArovu/RiiyWtSSGMRKQ7LBkMK9sHJ+DzRNIz0="}' \
             http://127.0.0.1:8787/v1/installations)
-          test "$relay_http_status" = "400"
-          docker compose exec -T relay sh -eu -c \
-            'test "$(id -u)" = 10001; test "$(id -g)" = 10001; test -f /var/lib/agentchannels-relay/agentchannels-relay.db'
+          test "$relay_http_status" = "401"
+          relay_http_status=$(curl --silent --output /tmp/relay-response \
+            --write-out '%{http_code}' --request POST \
+            --header 'content-type: application/json' \
+            --header 'authorization: Bearer wrong-token' \
+            --data '{"installationId":"ci","publicKeyBase64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}' \
+            http://127.0.0.1:8787/v1/installations)
+          test "$relay_http_status" = "401"
+          relay_http_status=$(curl --silent --output /tmp/relay-response \
+            --write-out '%{http_code}' --request POST \
+            --header 'content-type: application/json' \
+            --header 'authorization: Bearer ci-enrollment-token' \
+            --data '{"installationId":"ci","publicKeyBase64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}' \
+            http://127.0.0.1:8787/v1/installations)
+          test "$relay_http_status" = "200"
+          relay_container=$(docker compose -f compose.yml -f compose.build.yml ps -q relay)
+          docker inspect "$relay_container" --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}' | grep -F '10001:10001 true ["ALL"] ["no-new-privileges:true"]'
+          docker compose -f compose.yml -f compose.build.yml exec -T relay sh -eu -c \
+            'test "$(id -u)" = 10001; test "$(id -g)" = 10001; test -f /var/lib/agentchannels-relay/agentchannels-relay.db; test -d /var/lib/agentchannels-relay/backups'
 
-          docker compose stop relay
-          docker compose up -d relay
+          docker compose -f compose.yml -f compose.build.yml stop relay
+          docker compose -f compose.yml -f compose.build.yml rm -f relay
+          docker compose -f compose.yml -f compose.build.yml up -d relay
           wait_for_relay
-          docker compose exec -T relay test -f \
+          docker compose -f compose.yml -f compose.build.yml exec -T relay test -f \
             /var/lib/agentchannels-relay/agentchannels-relay.db
+
+          docker run -d --name relay-direct -p 127.0.0.1:8788:8787 \
+            -e AGENTCHANNELS_RELAY_BIND=0.0.0.0:8787 \
+            -e AGENTCHANNELS_RELAY_DATABASE=/tmp/direct.db \
+            -e AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN=ci-direct-token \
+            agentchannels-relay:test
+          for _ in $(seq 1 30); do curl --silent http://127.0.0.1:8788/ >/dev/null && break; sleep 1; done
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST --header 'content-type: application/json' \
+            --data '{"installationId":"direct","publicKeyBase64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}' \
+            http://127.0.0.1:8788/v1/installations)" = 401
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST --header 'content-type: application/json' \
+            --header 'authorization: Bearer ci-direct-token' \
+            --data '{"installationId":"direct","publicKeyBase64":"cEmbmOArovu/RiiyWtSSGMRKQ7LBkMK9sHJ+DzRNIz0="}' \
+            http://127.0.0.1:8788/v1/installations)" = 200
+          docker run -d --name relay-open -p 127.0.0.1:8789:8787 \
+            -e AGENTCHANNELS_RELAY_BIND=0.0.0.0:8787 \
+            -e AGENTCHANNELS_RELAY_DATABASE=/tmp/open.db \
+            -e AGENTCHANNELS_RELAY_ALLOW_OPEN_ENROLLMENT=true \
+            agentchannels-relay:test
+          for _ in $(seq 1 30); do curl --silent http://127.0.0.1:8789/ >/dev/null && break; sleep 1; done
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST --header 'content-type: application/json' \
+            --data '{"installationId":"open","publicKeyBase64":"cEmbmOArovu/RiiyWtSSGMRKQ7LBkMK9sHJ+DzRNIz0="}' \
+            http://127.0.0.1:8789/v1/installations)" = 200
+          python3 scripts/probe-unsupported-protocol.py 127.0.0.1 8789
 
       - name: Clean up Compose resources
         if: ${{ always() }}
-        run: docker compose down --volumes
+        run: |
+          docker compose -f compose.yml -f compose.build.yml down --volumes
+          rm -f secrets/relay-enrollment-token
