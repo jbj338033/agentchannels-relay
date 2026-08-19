@@ -19,13 +19,14 @@ use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use rand_core::{OsRng, RngCore};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{backup::Backup, params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, RwLock},
@@ -33,25 +34,101 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const PROTOCOL: u8 = 1;
+pub const PROTOCOL: u8 = 1;
+const SCHEMA_VERSION: i32 = 2;
+const COMPONENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const OPEN_ENROLLMENT_MAX_INSTALLATIONS: i64 = 10_000;
+const OPEN_ENROLLMENT_INACTIVE_DAYS: i64 = 90;
+
+#[derive(Clone, Debug)]
+pub enum EnrollmentPolicy {
+    Token(Vec<u8>),
+    Open,
+}
+
+impl EnrollmentPolicy {
+    pub fn from_env() -> Result<Self, String> {
+        let direct = std::env::var_os("AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN");
+        let file = std::env::var_os("AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN_FILE");
+        let open = std::env::var("AGENTCHANNELS_RELAY_ALLOW_OPEN_ENROLLMENT").ok();
+        if let Some(value) = open.as_deref() {
+            if value != "true" {
+                return Err(
+                    "AGENTCHANNELS_RELAY_ALLOW_OPEN_ENROLLMENT must be true when set".into(),
+                );
+            }
+        }
+        let configured = usize::from(direct.is_some())
+            + usize::from(file.is_some())
+            + usize::from(open.as_deref() == Some("true"));
+        if configured != 1 {
+            return Err("exactly one enrollment policy must be configured".into());
+        }
+        if let Some(token) = direct {
+            let token = token.to_string_lossy().as_bytes().to_vec();
+            return Self::from_values(Some(token), None, None);
+        }
+        if let Some(path) = file {
+            let token = std::fs::read(path).map_err(|_| "enrollment token file is unreadable")?;
+            return Self::from_values(None, Some(token), None);
+        }
+        Self::from_values(None, None, Some("true"))
+    }
+
+    fn from_values(
+        direct: Option<Vec<u8>>,
+        file_token: Option<Vec<u8>>,
+        open: Option<&str>,
+    ) -> Result<Self, String> {
+        if let Some(value) = open {
+            if value != "true" {
+                return Err(
+                    "AGENTCHANNELS_RELAY_ALLOW_OPEN_ENROLLMENT must be true when set".into(),
+                );
+            }
+        }
+        let configured = usize::from(direct.is_some())
+            + usize::from(file_token.is_some())
+            + usize::from(open == Some("true"));
+        if configured != 1 {
+            return Err("exactly one enrollment policy must be configured".into());
+        }
+        if let Some(token) = direct {
+            if token.is_empty() {
+                return Err("enrollment token is empty".into());
+            }
+            return Ok(Self::Token(token));
+        }
+        if let Some(token) = file_token {
+            let token = trim_token(token);
+            if token.is_empty() {
+                return Err("enrollment token file is empty".into());
+            }
+            return Ok(Self::Token(token));
+        }
+        Ok(Self::Open)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub database_path: PathBuf,
     pub response_timeout: Duration,
     pub auth_timeout: Duration,
+    pub enrollment_policy: EnrollmentPolicy,
 }
 
 impl RelayConfig {
-    pub fn new(database_path: PathBuf) -> Self {
+    pub fn new(database_path: PathBuf, enrollment_policy: EnrollmentPolicy) -> Self {
         Self {
             database_path,
             response_timeout: Duration::from_millis(2_500),
             auth_timeout: Duration::from_secs(10),
+            enrollment_policy,
         }
     }
     pub fn in_memory() -> Self {
-        Self::new(PathBuf::from(":memory:"))
+        Self::new(PathBuf::from(":memory:"), EnrollmentPolicy::Open)
     }
 }
 
@@ -63,6 +140,14 @@ pub enum RelayError {
     InvalidPublicKey,
     #[error("installation is already registered with a different key")]
     AlreadyRegistered,
+    #[error("database schema is newer than this binary supports")]
+    NewerSchema,
+    #[error("database migration backup failed")]
+    BackupFailed,
+    #[error("database migration {0} is missing")]
+    MissingMigration(i32),
+    #[error("open enrollment installation capacity reached")]
+    EnrollmentCapacity,
 }
 
 #[derive(Clone)]
@@ -87,7 +172,7 @@ impl AppState {
             }
             Connection::open(&config.database_path)?
         };
-        initialize_database(&connection)?;
+        initialize_database(&connection, &config)?;
         Ok(Self {
             db: Arc::new(Mutex::new(connection)),
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -119,11 +204,37 @@ impl AppState {
             }
             return Ok(());
         }
+        if matches!(self.config.enrollment_policy, EnrollmentPolicy::Open) {
+            prune_inactive_installations(&db)?;
+            let count: i64 =
+                db.query_row("SELECT COUNT(*) FROM installations", [], |row| row.get(0))?;
+            if count >= OPEN_ENROLLMENT_MAX_INSTALLATIONS {
+                return Err(RelayError::EnrollmentCapacity);
+            }
+        }
         db.execute(
-            "INSERT INTO installations (installation_id, public_key, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO installations (installation_id, public_key, created_at, enrolled_at, last_connected_at) VALUES (?1, ?2, ?3, ?3, NULL)",
             params![installation_id, public_key.as_slice(), now()],
         )?;
         Ok(())
+    }
+
+    pub fn enrollment_authorized(&self, headers: &HeaderMap) -> bool {
+        let EnrollmentPolicy::Token(expected) = &self.config.enrollment_policy else {
+            return true;
+        };
+        let presented = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::as_bytes)
+            .unwrap_or_default();
+        constant_time_token_eq(expected, presented)
+    }
+
+    pub fn schema_version(&self) -> Result<i32, RelayError> {
+        let db = self.db.lock().expect("database mutex poisoned");
+        Ok(db.query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 }
 
@@ -150,8 +261,15 @@ struct InstallationResponse {
 
 async fn register_installation(
     State(state): State<AppState>,
-    Json(input): Json<InstallationRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    if !state.enrollment_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let Ok(input) = serde_json::from_slice::<InstallationRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid installation request").into_response();
+    };
     if input.installation_id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "installationId is required").into_response();
     }
@@ -174,6 +292,7 @@ async fn register_installation(
         })
         .into_response(),
         Err(RelayError::AlreadyRegistered) => StatusCode::CONFLICT.into_response(),
+        Err(RelayError::EnrollmentCapacity) => StatusCode::TOO_MANY_REQUESTS.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -260,45 +379,64 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         return;
     }
     let first = timeout(state.config.auth_timeout, socket.recv()).await;
-    let Some(Ok(Message::Text(text))) = first.ok().flatten() else {
-        return;
+    let text = match first.ok().flatten() {
+        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(Message::Binary(_))) => {
+            send_error(
+                &mut socket,
+                "invalid_message",
+                "authenticate must be JSON text",
+            )
+            .await;
+            return;
+        }
+        _ => return,
     };
-    let Ok(LocalMessage::Authenticate {
-        protocol,
-        installation_id,
-        signature_base64,
-    }) = serde_json::from_str(&text)
-    else {
+    let Ok(first_message) = serde_json::from_str::<LocalMessage>(&text) else {
         let _ = send_json(
             &mut socket,
             &RelayMessage::Error {
                 protocol: PROTOCOL,
-                code: "unauthenticated",
+                code: "invalid_message",
                 message: "authenticate is required",
             },
         )
         .await;
         return;
     };
-    if protocol != PROTOCOL
-        || !verify_auth(
-            &state,
-            &installation_id,
-            nonce.as_bytes(),
-            &signature_base64,
-        )
-    {
-        let _ = send_json(
+    let LocalMessage::Authenticate {
+        protocol,
+        installation_id,
+        signature_base64,
+    } = first_message
+    else {
+        send_error(&mut socket, "invalid_message", "authenticate is required").await;
+        return;
+    };
+    if protocol != PROTOCOL {
+        send_error(
             &mut socket,
-            &RelayMessage::Error {
-                protocol: PROTOCOL,
-                code: "unauthenticated",
-                message: "invalid installation authentication",
-            },
+            "unsupported_protocol",
+            &format!("protocol {protocol} is not supported"),
         )
         .await;
         return;
     }
+    if !verify_auth(
+        &state,
+        &installation_id,
+        nonce.as_bytes(),
+        &signature_base64,
+    ) {
+        send_error(
+            &mut socket,
+            "unauthenticated",
+            "invalid installation authentication",
+        )
+        .await;
+        return;
+    }
+    update_last_connected(&state, &installation_id);
     let _ = send_json(
         &mut socket,
         &RelayMessage::Authenticated { protocol: PROTOCOL },
@@ -324,8 +462,18 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         }
     });
     while let Some(Ok(message)) = receiver.next().await {
-        let Message::Text(text) = message else {
-            continue;
+        let text = match message {
+            Message::Text(text) => text,
+            Message::Binary(_) => {
+                send_error_on_channel(
+                    &handle,
+                    "invalid_message",
+                    "relay messages must be JSON text",
+                );
+                continue;
+            }
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
         };
         match serde_json::from_str::<LocalMessage>(&text) {
             Ok(LocalMessage::SyncBindings { protocol, bindings }) if protocol == PROTOCOL => {
@@ -362,7 +510,24 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
                     });
                 }
             }
-            _ => {}
+            Ok(LocalMessage::SyncBindings { protocol, .. })
+            | Ok(LocalMessage::WebhookResponse { protocol, .. }) => {
+                send_error_on_channel(
+                    &handle,
+                    "unsupported_protocol",
+                    &format!("protocol {protocol} is not supported"),
+                );
+            }
+            Ok(LocalMessage::Authenticate { .. }) => {
+                send_error_on_channel(
+                    &handle,
+                    "invalid_message",
+                    "authenticate is only valid once",
+                );
+            }
+            Err(_) => {
+                send_error_on_channel(&handle, "invalid_message", "unsupported relay message");
+            }
         }
     }
     handle.close();
@@ -433,6 +598,28 @@ impl ConnectionHandle {
             drop(tx);
         }
     }
+}
+
+async fn send_error(socket: &mut WebSocket, code: &str, message: &str) {
+    let _ = send_json(
+        socket,
+        &RelayMessage::Error {
+            protocol: PROTOCOL,
+            code,
+            message,
+        },
+    )
+    .await;
+}
+
+fn send_error_on_channel(handle: &ConnectionHandle, code: &str, message: &str) {
+    let serialized = serde_json::to_string(&RelayMessage::Error {
+        protocol: PROTOCOL,
+        code,
+        message,
+    })
+    .expect("relay errors serialize");
+    let _ = handle.sender.try_send(serialized);
 }
 
 #[derive(Debug)]
@@ -582,8 +769,184 @@ fn replace_bindings(
     tx.commit()
 }
 
-fn initialize_database(db: &Connection) -> Result<(), rusqlite::Error> {
-    db.execute_batch("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS installations (installation_id TEXT PRIMARY KEY, public_key BLOB NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings (binding_id TEXT PRIMARY KEY, connector TEXT NOT NULL CHECK (connector IN ('linear','slack')), installation_id TEXT NOT NULL REFERENCES installations(installation_id) ON DELETE CASCADE, updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS bindings_installation_idx ON bindings(installation_id);")
+fn initialize_database(db: &Connection, config: &RelayConfig) -> Result<(), RelayError> {
+    db.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let declared: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if declared > SCHEMA_VERSION {
+        return Err(RelayError::NewerSchema);
+    }
+    let has_installations = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='installations')",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    let source = if declared == 0 && has_installations {
+        1
+    } else {
+        declared
+    };
+    if source < SCHEMA_VERSION {
+        if config.database_path.as_os_str() != ":memory:" {
+            create_backup(db, config, source)?;
+        }
+        for target in (source + 1)..=SCHEMA_VERSION {
+            let tx = db.unchecked_transaction()?;
+            match target {
+                1 => tx.execute_batch(
+                    "CREATE TABLE installations (installation_id TEXT PRIMARY KEY, public_key BLOB NOT NULL, created_at TEXT NOT NULL); CREATE TABLE bindings (binding_id TEXT PRIMARY KEY, connector TEXT NOT NULL CHECK (connector IN ('linear','slack')), installation_id TEXT NOT NULL REFERENCES installations(installation_id) ON DELETE CASCADE, updated_at TEXT NOT NULL); CREATE INDEX bindings_installation_idx ON bindings(installation_id);",
+                )?,
+                2 => {
+                    if !has_column(&tx, "installations", "enrolled_at") {
+                        tx.execute_batch(
+                            "ALTER TABLE installations ADD COLUMN enrolled_at TEXT; ALTER TABLE installations ADD COLUMN last_connected_at TEXT; UPDATE installations SET enrolled_at = created_at WHERE enrolled_at IS NULL;",
+                        )?;
+                    }
+                }
+                _ => return Err(RelayError::MissingMigration(target)),
+            }
+            record_migration(&tx, target)?;
+            tx.pragma_update(None, "user_version", target)?;
+            tx.commit()?;
+        }
+    } else if !has_table(db, "schema_migrations")? {
+        if config.database_path.as_os_str() != ":memory:" {
+            create_backup(db, config, source)?;
+        }
+        let tx = db.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);")?;
+        if source >= 1 {
+            record_migration(&tx, 1)?;
+        }
+        if source >= 2 {
+            record_migration(&tx, 2)?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn create_backup(db: &Connection, config: &RelayConfig, source: i32) -> Result<(), RelayError> {
+    let database_parent = config
+        .database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let backup_dir = database_parent.join("backups");
+    std::fs::create_dir_all(&backup_dir).map_err(|_| RelayError::BackupFailed)?;
+    set_operator_only_directory(&backup_dir)?;
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let path = backup_dir.join(format!(
+        "agentchannels-relay-v{COMPONENT_VERSION}-schema-{source}-{timestamp}.sqlite3"
+    ));
+    let mut backup_file = std::fs::OpenOptions::new();
+    backup_file.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        backup_file.mode(0o600);
+    }
+    drop(
+        backup_file
+            .open(&path)
+            .map_err(|_| RelayError::BackupFailed)?,
+    );
+    let mut destination = Connection::open(&path).map_err(|_| RelayError::BackupFailed)?;
+    let backup = Backup::new(db, &mut destination).map_err(|_| RelayError::BackupFailed)?;
+    backup
+        .run_to_completion(128, std::time::Duration::from_millis(1), None)
+        .map_err(|_| RelayError::BackupFailed)?;
+    drop(backup);
+    set_operator_only_file(&path)?;
+    Ok(())
+}
+
+fn set_operator_only_directory(path: &std::path::Path) -> Result<(), RelayError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| RelayError::BackupFailed)?;
+    }
+    Ok(())
+}
+
+fn set_operator_only_file(path: &std::path::Path) -> Result<(), RelayError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| RelayError::BackupFailed)?;
+    }
+    Ok(())
+}
+
+fn record_migration(tx: &rusqlite::Transaction<'_>, version: i32) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![version, now()],
+    )?;
+    Ok(())
+}
+
+fn has_table(db: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        params![name],
+        |row| row.get::<_, i32>(0),
+    )? != 0)
+}
+
+fn has_column(db: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({table})");
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return false;
+    };
+    let found = {
+        let Ok(columns) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+            return false;
+        };
+        columns.flatten().any(|name| name == column)
+    };
+    found
+}
+
+fn prune_inactive_installations(db: &Connection) -> Result<(), rusqlite::Error> {
+    let cutoff = Utc::now() - chrono::Duration::days(OPEN_ENROLLMENT_INACTIVE_DAYS);
+    db.execute(
+        "DELETE FROM installations WHERE COALESCE(last_connected_at, enrolled_at, created_at) < ?1",
+        params![format_time(cutoff)],
+    )?;
+    Ok(())
+}
+
+fn update_last_connected(state: &AppState, installation_id: &str) {
+    if let Ok(db) = state.db.lock() {
+        let _ = db.execute(
+            "UPDATE installations SET last_connected_at = ?1 WHERE installation_id = ?2",
+            params![now(), installation_id],
+        );
+    }
+}
+
+fn trim_token(mut token: Vec<u8>) -> Vec<u8> {
+    while token.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+        token.pop();
+    }
+    token
+}
+
+fn constant_time_token_eq(expected: &[u8], presented: &[u8]) -> bool {
+    let width = expected.len().max(presented.len());
+    let mut expected_padded = vec![0u8; width];
+    let mut presented_padded = vec![0u8; width];
+    expected_padded[..expected.len()].copy_from_slice(expected);
+    presented_padded[..presented.len()].copy_from_slice(presented);
+    let same_bytes = expected_padded.ct_eq(&presented_padded);
+    let same_length = expected.len().ct_eq(&presented.len());
+    (same_bytes & same_length).unwrap_u8() == 1
 }
 
 fn now() -> String {

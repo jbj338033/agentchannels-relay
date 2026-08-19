@@ -1,0 +1,6 @@
+services:
+  relay:
+    image: agentchannels-relay:local
+    build:
+      context: .
+      dockerfile: Dockerfile

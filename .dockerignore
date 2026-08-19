@@ -8,5 +8,6 @@ target
 *.sqlite3-*
 .env
 .env.*
+secrets/relay-enrollment-token
 .DS_Store
 Thumbs.db

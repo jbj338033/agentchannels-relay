@@ -2,6 +2,7 @@ use super::*;
 use axum::body::Body;
 use ed25519_dalek::{Signer, SigningKey};
 use http::{Request, StatusCode};
+use std::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 use tower::ServiceExt;
@@ -22,6 +23,51 @@ fn installation_authentication_accepts_only_registered_ed25519_signature() {
     assert!(verify_auth(&state, "install-1", nonce, &signature));
     assert!(!verify_auth(&state, "unknown", nonce, &signature));
     assert!(!verify_auth(&state, "install-1", b"different", &signature));
+}
+
+#[test]
+fn registration_is_idempotent_for_the_same_key_and_conflicts_for_a_new_key() {
+    let state = state();
+    let original = SigningKey::generate(&mut OsRng);
+    let replacement = SigningKey::generate(&mut OsRng);
+    assert!(state
+        .register_installation("install-idempotent", original.verifying_key().as_bytes())
+        .is_ok());
+    assert!(state
+        .register_installation("install-idempotent", original.verifying_key().as_bytes())
+        .is_ok());
+    assert!(matches!(
+        state.register_installation("install-idempotent", replacement.verifying_key().as_bytes()),
+        Err(RelayError::AlreadyRegistered)
+    ));
+}
+
+#[test]
+fn enrollment_token_rotation_preserves_ed25519_reconnect_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "agentchannels-relay-token-rotation-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("relay.db");
+    let signing_key = SigningKey::generate(&mut OsRng);
+    {
+        let config = RelayConfig::new(
+            database.clone(),
+            EnrollmentPolicy::Token(b"old-token".to_vec()),
+        );
+        let state = AppState::open(config).unwrap();
+        state
+            .register_installation("install-rotation", signing_key.verifying_key().as_bytes())
+            .unwrap();
+    }
+    let config = RelayConfig::new(database, EnrollmentPolicy::Token(b"new-token".to_vec()));
+    let state = AppState::open(config).unwrap();
+    let nonce = b"rotation-challenge";
+    let signature = BASE64.encode(signing_key.sign(nonce).to_bytes());
+    assert!(verify_auth(&state, "install-rotation", nonce, &signature));
+    drop(state);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -146,10 +192,258 @@ fn webhook_body_is_not_persisted() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(tables, vec!["installations", "bindings"]);
+    assert_eq!(
+        tables,
+        vec!["installations", "bindings", "schema_migrations"]
+    );
     assert!(tables
         .iter()
         .all(|table| !table.contains("payload") && !table.contains("body")));
+}
+
+#[tokio::test]
+async fn protected_enrollment_has_identical_unauthorized_response() {
+    let mut config = RelayConfig::in_memory();
+    config.enrollment_policy = EnrollmentPolicy::Token(b"correct-token".to_vec());
+    let state = AppState::open(config).unwrap();
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/installations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"installationId":"protected","publicKeyBase64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}).to_string(),
+            ))
+            .unwrap()
+    };
+    let missing = state.router().oneshot(request()).await.unwrap();
+    let invalid = state
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/installations")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer wrong-token")
+                .body(Body::from(
+                    serde_json::json!({"installationId":"protected","publicKeyBase64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        axum::body::to_bytes(missing.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        axum::body::to_bytes(invalid.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn explicit_open_enrollment_accepts_a_valid_key() {
+    let state = state();
+    let key = SigningKey::generate(&mut OsRng);
+    let response = state
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/installations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "installationId": "open-install",
+                        "publicKeyBase64": BASE64.encode(key.verifying_key().as_bytes())
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn legacy_schema_migration_creates_backup_and_preserves_data() {
+    let root =
+        std::env::temp_dir().join(format!("agentchannels-relay-migration-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("relay.db");
+    {
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE installations (installation_id TEXT PRIMARY KEY, public_key BLOB NOT NULL, created_at TEXT NOT NULL); CREATE TABLE bindings (binding_id TEXT PRIMARY KEY, connector TEXT NOT NULL, installation_id TEXT NOT NULL, updated_at TEXT NOT NULL); INSERT INTO installations VALUES ('keep', x'0000000000000000000000000000000000000000000000000000000000000000', '2026-01-01T00:00:00.000Z'); INSERT INTO bindings VALUES ('binding-keep', 'slack', 'keep', '2026-01-01T00:00:00.000Z');") .unwrap();
+    }
+    let state = AppState::open(RelayConfig::new(database.clone(), EnrollmentPolicy::Open)).unwrap();
+    assert_eq!(state.schema_version().unwrap(), SCHEMA_VERSION);
+    {
+        let db = state.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT public_key FROM installations WHERE installation_id = 'keep'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            vec![0u8; 32]
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT installation_id FROM bindings WHERE binding_id = 'binding-keep'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "keep"
+        );
+    }
+    let backups = fs::read_dir(root.join("backups"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(backups.len(), 1);
+    let name = backups[0].file_name().to_string_lossy().to_string();
+    assert!(name.contains("agentchannels-relay-v1.0.0-schema-1-"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(root.join("backups"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(backups[0].path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn migration_refuses_when_backup_destination_cannot_be_created() {
+    let root = std::env::temp_dir().join(format!(
+        "agentchannels-relay-backup-failure-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("relay.db");
+    {
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE installations (installation_id TEXT PRIMARY KEY, public_key BLOB NOT NULL, created_at TEXT NOT NULL); CREATE TABLE bindings (binding_id TEXT PRIMARY KEY, connector TEXT NOT NULL, installation_id TEXT NOT NULL, updated_at TEXT NOT NULL); INSERT INTO installations VALUES ('keep', x'0000000000000000000000000000000000000000000000000000000000000000', '2026-01-01T00:00:00.000Z');").unwrap();
+    }
+    fs::write(root.join("backups"), b"not a directory").unwrap();
+    assert!(matches!(
+        AppState::open(RelayConfig::new(database.clone(), EnrollmentPolicy::Open)),
+        Err(RelayError::BackupFailed)
+    ));
+    let unchanged = rusqlite::Connection::open(&database).unwrap();
+    assert!(!has_column(&unchanged, "installations", "enrolled_at"));
+    assert_eq!(
+        unchanged
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        0
+    );
+    drop(unchanged);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn newer_schema_is_refused_without_mutation() {
+    let root = std::env::temp_dir().join(format!("agentchannels-relay-newer-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("relay.db");
+    {
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+    }
+    let expected = fs::read(&database).unwrap();
+    assert!(matches!(
+        AppState::open(RelayConfig::new(database.clone(), EnrollmentPolicy::Open)),
+        Err(RelayError::NewerSchema)
+    ));
+    assert_eq!(fs::read(&database).unwrap(), expected);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn conformance_fixture_declares_protocol_one_and_explicit_rejection() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../protocol/v1/messages.json")).unwrap();
+    assert_eq!(fixture["protocol"], PROTOCOL);
+    assert_eq!(fixture["rejected"][0]["errorCode"], "unsupported_protocol");
+}
+
+#[test]
+fn enrollment_policy_rejects_invalid_combinations_and_empty_tokens() {
+    assert!(EnrollmentPolicy::from_values(None, None, None).is_err());
+    assert!(EnrollmentPolicy::from_values(Some(b"token".to_vec()), None, Some("true")).is_err());
+    assert!(EnrollmentPolicy::from_values(None, Some(b"token".to_vec()), Some("true")).is_err());
+    assert!(EnrollmentPolicy::from_values(Some(Vec::new()), None, None).is_err());
+    assert!(EnrollmentPolicy::from_values(None, Some(Vec::new()), None).is_err());
+    assert!(EnrollmentPolicy::from_values(None, None, Some("false")).is_err());
+    assert!(matches!(
+        EnrollmentPolicy::from_values(None, Some(b"token\n".to_vec()), None),
+        Ok(EnrollmentPolicy::Token(token)) if token == b"token"
+    ));
+}
+
+#[test]
+fn open_enrollment_prunes_inactive_records_and_enforces_capacity() {
+    let state = state();
+    {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO installations (installation_id, public_key, created_at, enrolled_at, last_connected_at) VALUES ('inactive', ?1, '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', NULL)",
+            [vec![0u8; 32]],
+        )
+        .unwrap();
+    }
+    let key = SigningKey::generate(&mut OsRng);
+    state
+        .register_installation("fresh", key.verifying_key().as_bytes())
+        .unwrap();
+    let db = state.db.lock().unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM installations WHERE installation_id = 'inactive'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    drop(db);
+
+    let db = state.db.lock().unwrap();
+    let tx = db.unchecked_transaction().unwrap();
+    for index in 0..OPEN_ENROLLMENT_MAX_INSTALLATIONS {
+        tx.execute(
+            "INSERT INTO installations (installation_id, public_key, created_at, enrolled_at, last_connected_at) VALUES (?1, ?2, ?3, ?3, NULL)",
+            rusqlite::params![format!("capacity-{index}"), vec![1u8; 32], now()],
+        ).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let key = SigningKey::generate(&mut OsRng);
+    assert!(matches!(
+        state.register_installation("over-capacity", key.verifying_key().as_bytes()),
+        Err(RelayError::EnrollmentCapacity)
+    ));
 }
 
 #[test]

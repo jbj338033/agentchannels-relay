@@ -11,8 +11,8 @@ RUN groupadd --gid 10001 agentchannels-relay \
     && useradd --uid 10001 --gid 10001 --no-create-home \
       --home-dir /var/lib/agentchannels-relay --shell /usr/sbin/nologin \
       agentchannels-relay \
-    && mkdir -p /var/lib/agentchannels-relay \
-    && chown 10001:10001 /var/lib/agentchannels-relay
+    && mkdir -p -m 0700 /var/lib/agentchannels-relay/backups \
+    && chown -R 10001:10001 /var/lib/agentchannels-relay
 
 COPY --from=builder --chown=10001:10001 \
   /build/target/release/agentchannels-relay \
