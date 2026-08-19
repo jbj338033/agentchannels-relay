@@ -1,0 +1,372 @@
+name: Publish Relay image
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: relay-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out exact release tag
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate immutable inputs and record counterparts
+        id: release
+        shell: bash
+        env:
+          CANDIDATE_CLIENT_REF: ${{ vars.AGENTCHANNELS_CLIENT_CANDIDATE_REF }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
+          version="${RELEASE_TAG#v}"
+          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          test "$version" = "$cargo_version"
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
+          if [[ "$version" == *-* ]]; then
+            test "$RELEASE_PRERELEASE" = true
+          else
+            test "$RELEASE_PRERELEASE" = false
+          fi
+          grep -q 'repository = "https://github.com/agentchannels/agentchannels-relay"' Cargo.toml
+          grep -q '^license = ' Cargo.toml
+          test -f LICENSE
+          compose_repository="$(sed -n 's/.*image: \(ghcr.io\/agentchannels\/agentchannels-relay\):.*/\1/p' compose.yml)"
+          compose_version="$(sed -n 's/.*image: ghcr.io\/agentchannels\/agentchannels-relay:\([^[:space:]]*\).*/\1/p' compose.yml)"
+          test "$compose_repository" = ghcr.io/agentchannels/agentchannels-relay
+          test "$compose_version" = "$cargo_version"
+          grep -Fq "$version" <<<"$RELEASE_BODY"
+          grep -Eiq 'protocol(s| version)?[^[:cntrl:]]*(^|[^0-9])1([^0-9]|$)' <<<"$RELEASE_BODY"
+          schema_line="$(grep -Ei '^schema migration:' <<<"$RELEASE_BODY" | head -n 1)"
+          test -n "$schema_line"
+          grep -Eiq 'rollback' <<<"$RELEASE_BODY"
+          if grep -Eiq '^schema migration:[[:space:]]*(none|unchanged)' <<<"$schema_line"; then
+            schema_changed=false
+          else
+            schema_changed=true
+          fi
+          [[ "$CANDIDATE_CLIENT_REF" =~ ^[0-9a-f]{40}$ ]]
+
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          owner_type="$(gh api "repos/$GITHUB_REPOSITORY" --jq .owner.type)"
+          if test "$owner_type" = Organization; then
+            package_path="orgs/$GITHUB_REPOSITORY_OWNER/packages/container/$repository_name/versions"
+          else
+            package_path="users/$GITHUB_REPOSITORY_OWNER/packages/container/$repository_name/versions"
+          fi
+          package_status="$(curl --silent --show-error --output "$RUNNER_TEMP/target-package.json" \
+            --write-out '%{http_code}' \
+            --header "authorization: Bearer $GH_TOKEN" \
+            --header 'accept: application/vnd.github+json' \
+            "https://api.github.com/$package_path?per_page=100")"
+          case "$package_status" in
+            404) ;;
+            200)
+              gh api --paginate --slurp "$package_path?per_page=100" \
+                > "$RUNNER_TEMP/target-package-pages.json"
+              if jq -e --arg version "$version" \
+                'any(.[][]; ((.metadata.container.tags // []) | index($version)) != null)' \
+                "$RUNNER_TEMP/target-package-pages.json" >/dev/null; then
+                echo "full GHCR tag already exists" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "unable to prove the full GHCR tag is absent (HTTP $package_status)" >&2
+              exit 1
+              ;;
+          esac
+
+          stable_client="$(curl --fail --silent --show-error \
+            https://registry.npmjs.org/agentchannels \
+            | jq -r '."dist-tags".latest // empty' || true)"
+          stable_relay_digest="$(
+            gh api --paginate --slurp \
+              'orgs/agentchannels/packages/container/agentchannels-relay/versions?per_page=100' \
+              2>/dev/null \
+              | jq -r '[.[][] | select((.metadata.container.tags // []) | index("latest")) | .name][0] // empty' \
+              || true
+          )"
+          {
+            printf 'version=%s\n' "$version"
+            printf 'schema_changed=%s\n' "$schema_changed"
+            printf 'candidate_client_ref=%s\n' "$CANDIDATE_CLIENT_REF"
+            printf 'stable_client=%s\n' "${stable_client:-missing}"
+            printf 'stable_relay_digest=%s\n' "${stable_relay_digest:-missing}"
+          } | tee -a "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out exact candidate client
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: agentchannels/agentchannels
+          ref: ${{ steps.release.outputs.candidate_client_ref }}
+          path: .compat/candidate-client
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          package_json_file: .compat/candidate-client/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: .compat/candidate-client/pnpm-lock.yaml
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Verify candidate client source
+        run: |
+          pnpm --dir .compat/candidate-client install --frozen-lockfile
+          pnpm --dir .compat/candidate-client check
+
+      - name: Run locked Relay checks
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --locked
+          cargo build --release --locked
+
+      - name: Build native candidate image
+        run: >-
+          docker build --pull
+          -t agentchannels-relay:candidate
+          -t "$IMAGE_REPOSITORY:${{ steps.release.outputs.version }}"
+          .
+
+      - name: Verify released-image and source-build Compose paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          export COMPOSE_PROJECT_NAME="relay-release-${GITHUB_RUN_ID}"
+          enrollment_file="secrets/relay-enrollment-token"
+          printf 'release-compose-token\n' > "$enrollment_file"
+          chmod 600 "$enrollment_file"
+          cleanup() {
+            docker compose -f compose.yml -f compose.build.yml down --volumes >/dev/null 2>&1 || true
+            rm -f "$enrollment_file"
+          }
+          trap cleanup EXIT
+          wait_for_relay() {
+            for _ in $(seq 1 30); do
+              curl --silent --output /dev/null http://127.0.0.1:8787/ && return
+              sleep 1
+            done
+            return 1
+          }
+
+          docker compose -f compose.yml config --quiet
+          docker compose -f compose.yml -f compose.build.yml config --quiet
+          docker compose -f compose.yml up -d
+          wait_for_relay
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST --header 'content-type: application/json' \
+            --header 'authorization: Bearer release-compose-token' \
+            --data '{"installationId":"release-compose","publicKeyBase64":"cEmbmOArovu/RiiyWtSSGMRKQ7LBkMK9sHJ+DzRNIz0="}' \
+            http://127.0.0.1:8787/v1/installations)" = 200
+          relay_container="$(docker compose -f compose.yml ps -q relay)"
+          docker inspect "$relay_container" \
+            --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}' \
+            | grep -F '10001:10001 true ["ALL"] ["no-new-privileges:true"]'
+          docker compose -f compose.yml exec -T relay sh -eu -c \
+            'test -f /var/lib/agentchannels-relay/agentchannels-relay.db; test -d /var/lib/agentchannels-relay/backups'
+          python3 scripts/probe-unsupported-protocol.py
+          docker compose -f compose.yml stop relay
+          docker compose -f compose.yml rm -f relay
+          docker compose -f compose.yml up -d
+          wait_for_relay
+          docker compose -f compose.yml exec -T relay test -f \
+            /var/lib/agentchannels-relay/agentchannels-relay.db
+          docker compose -f compose.yml down
+
+          docker compose -f compose.yml -f compose.build.yml up --build -d
+          wait_for_relay
+          docker compose -f compose.yml -f compose.build.yml exec -T relay \
+            test -f /var/lib/agentchannels-relay/agentchannels-relay.db
+
+      - name: Verify migration and protocol invariants
+        run: |
+          cargo test --locked protected_enrollment_has_identical_unauthorized_response
+          cargo test --locked open_enrollment_prunes_inactive_records_and_enforces_capacity
+          cargo test --locked legacy_schema_migration_creates_backup_and_preserves_data
+          cargo test --locked migration_refuses_when_backup_destination_cannot_be_created
+          cargo test --locked newer_schema_is_refused_without_mutation
+          cargo test --locked conformance_fixture_declares_protocol_one_and_explicit_rejection
+
+      - name: Verify all available protocol pairings
+        shell: bash
+        env:
+          STABLE_CLIENT: ${{ steps.release.outputs.stable_client }}
+          STABLE_RELAY_DIGEST: ${{ steps.release.outputs.stable_relay_digest }}
+        run: |
+          set -euo pipefail
+          candidate_module="file://$(realpath .compat/candidate-client/dist/index.js)"
+          cleanup() { docker rm -f relay-conformance >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          run_pair() {
+            relay_image="$1"
+            client_module="$2"
+            cleanup
+            docker run --detach --rm --name relay-conformance \
+              --publish 127.0.0.1:8787:8787 \
+              --env AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN=conformance-token \
+              "$relay_image"
+            for _ in $(seq 1 30); do
+              curl --silent --output /dev/null http://127.0.0.1:8787/ && break
+              sleep 1
+            done
+            AGENTCHANNELS_CONFORMANCE_ENROLLMENT_TOKEN=conformance-token \
+              pnpm --dir .compat/candidate-client exec node scripts/protocol-conformance.mjs \
+              --origin http://127.0.0.1:8787 \
+              --client-module "$client_module"
+          }
+
+          run_pair agentchannels-relay:candidate "$candidate_module"
+          if test "$STABLE_RELAY_DIGEST" != missing; then
+            run_pair \
+              "ghcr.io/agentchannels/agentchannels-relay@$STABLE_RELAY_DIGEST" \
+              "$candidate_module"
+          fi
+          if test "$STABLE_CLIENT" != missing; then
+            mkdir -p .compat/stable-client
+            pnpm --dir .compat/stable-client init --bare
+            pnpm --dir .compat/stable-client add --save-exact \
+              "agentchannels@$STABLE_CLIENT"
+            stable_module="file://$(realpath .compat/stable-client/node_modules/agentchannels/dist/index.js)"
+            run_pair agentchannels-relay:candidate "$stable_module"
+          fi
+
+      - name: Verify previous-stable upgrade and rollback
+        if: steps.release.outputs.stable_relay_digest != 'missing'
+        shell: bash
+        env:
+          SCHEMA_CHANGED: ${{ steps.release.outputs.schema_changed }}
+          STABLE_RELAY_DIGEST: ${{ steps.release.outputs.stable_relay_digest }}
+        run: |
+          set -euo pipefail
+          volume="relay-upgrade-${GITHUB_RUN_ID}"
+          state_file="$RUNNER_TEMP/relay-upgrade-identity.json"
+          candidate_module="file://$(realpath .compat/candidate-client/dist/index.js)"
+          cleanup() {
+            docker rm -f relay-upgrade >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+            rm -f "$state_file"
+          }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+          start_relay() {
+            image="$1"
+            docker run --detach --rm --name relay-upgrade \
+              --publish 127.0.0.1:8790:8787 \
+              --volume "$volume:/var/lib/agentchannels-relay" \
+              --env AGENTCHANNELS_RELAY_BIND=0.0.0.0:8787 \
+              --env AGENTCHANNELS_RELAY_DATABASE=/var/lib/agentchannels-relay/agentchannels-relay.db \
+              --env AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN=upgrade-token \
+              "$image"
+            for _ in $(seq 1 30); do
+              curl --silent --output /dev/null http://127.0.0.1:8790/ && return
+              sleep 1
+            done
+            return 1
+          }
+          run_upgrade_probe() {
+            AGENTCHANNELS_CONFORMANCE_ENROLLMENT_TOKEN=upgrade-token \
+              pnpm --dir .compat/candidate-client exec node scripts/protocol-conformance.mjs \
+              --origin http://127.0.0.1:8790 \
+              --client-module "$candidate_module" \
+              --state-file "$state_file" "$@"
+          }
+
+          stable_image="ghcr.io/agentchannels/agentchannels-relay@$STABLE_RELAY_DIGEST"
+          start_relay "$stable_image"
+          run_upgrade_probe
+          docker rm -f relay-upgrade >/dev/null
+          start_relay agentchannels-relay:candidate
+          run_upgrade_probe --expect-existing-binding
+          docker rm -f relay-upgrade >/dev/null
+
+          if test "$SCHEMA_CHANGED" = true; then
+            docker run --rm --volume "$volume:/data" \
+              --env ACK_POST_BACKUP_DATA_LOSS=I_UNDERSTAND_POST_BACKUP_DATA_LOSS \
+              --entrypoint sh agentchannels-relay:candidate -eu -c '
+                test "$ACK_POST_BACKUP_DATA_LOSS" = I_UNDERSTAND_POST_BACKUP_DATA_LOSS
+                set -- /data/backups/*.sqlite3
+                test -f "$1"
+                mkdir /data/pre-restore
+                cp /data/agentchannels-relay.db* /data/pre-restore/
+                rm -f /data/agentchannels-relay.db-wal /data/agentchannels-relay.db-shm
+                cp "$1" /data/agentchannels-relay.db
+              '
+          fi
+          start_relay "$stable_image"
+          run_upgrade_probe --expect-existing-binding
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Select immutable and moving tags
+        id: image
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          {
+            echo 'tags<<EOF'
+            echo "$IMAGE_REPOSITORY:$version"
+            if [[ "$version" != *-* ]]; then
+              IFS=. read -r major minor _patch <<<"$version"
+              echo "$IMAGE_REPOSITORY:$major.$minor"
+              echo "$IMAGE_REPOSITORY:$major"
+              echo "$IMAGE_REPOSITORY:latest"
+            fi
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish multi-architecture image
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+          provenance: mode=max
+
+      - name: Record manifest digest
+        run: |
+          echo "Manifest digest: ${{ steps.publish.outputs.digest }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
