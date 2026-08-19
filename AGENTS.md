@@ -19,12 +19,15 @@ decisions, or verify provider signatures.
 - Unknown connectors or Bindings return HTTP 404.
 - A known Binding with no active installation connection, or one that times out,
   returns HTTP 200 and drops the event; it must never become delayed work.
-- The default listener is loopback. The binary has no TLS and
-  `POST /v1/installations` has no administrator authentication. Provider
-  signatures are verified by the local AgentChannels installation. Do not
-  describe this service as safe for direct public exposure.
+- The default listener is loopback and the binary has no TLS. Public deployment
+  requires an edge TLS/rate-limit boundary and exactly one enrollment policy.
+  Provider signatures are verified by the local AgentChannels installation.
 - Protocol changes must be coordinated with the `agentchannels` repository and
   tested against both implementations.
+- Release notes must state the component version, supported protocol, schema
+  impact, and rollback requirements. Publication compatibility uses an exact
+  candidate client commit plus every available exact stable counterpart; never
+  treat a missing artifact as a passed pairing.
 
 ## Commands
 
@@ -33,18 +36,31 @@ From this repository:
 ```sh
 cargo fmt --all
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked
-cargo build --release
+cargo build --release --locked
 docker build --pull -t agentchannels-relay:test .
-docker compose config --quiet
-docker compose up --build -d
-docker compose down --volumes
+docker compose -f compose.yml config --quiet
+docker compose -f compose.yml -f compose.build.yml config --quiet
+docker compose -f compose.yml -f compose.build.yml up --build -d
+docker compose -f compose.yml -f compose.build.yml down --volumes
 ```
 
-Run the binary with `cargo run --release`. `AGENTCHANNELS_RELAY_BIND` defaults
+Run the binary with `cargo run --release --locked`. `AGENTCHANNELS_RELAY_BIND` defaults
 to `127.0.0.1:8787`; `AGENTCHANNELS_RELAY_DATABASE` defaults to
 `agentchannels-relay.db`.
+
+Enrollment startup requires exactly one of `AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN`,
+`AGENTCHANNELS_RELAY_ENROLLMENT_TOKEN_FILE`, or
+`AGENTCHANNELS_RELAY_ALLOW_OPEN_ENROLLMENT=true`. Compose mounts the token-file
+policy as `/run/secrets/relay_enrollment_token`; edge rate limiting remains a
+deployment concern for public installations.
+
+Compose uses `./secrets/relay-enrollment-token` as its enrollment secret file;
+copy the example file there and replace it with an operator-controlled value
+before starting a production instance. Migration backups are restored
+only by an operator after preserving the current database and explicitly
+acknowledging post-backup data loss; the Relay has no down-migration path.
 
 ## Change-specific verification
 
