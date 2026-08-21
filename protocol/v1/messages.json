@@ -11,7 +11,10 @@
     },
     {
       "direction": "relayToLocal",
-      "message": { "type": "authenticated", "protocol": 1 }
+      "message": {
+        "type": "authenticated",
+        "protocol": 1
+      }
     },
     {
       "direction": "relayToLocal",
@@ -23,7 +26,9 @@
         "connector": "slack",
         "receivedAt": "2026-01-01T00:00:00.000Z",
         "expiresAt": "2026-01-01T00:00:02.500Z",
-        "headers": { "x-test": "1" },
+        "headers": {
+          "x-test": "1"
+        },
         "rawBodyBase64": "eA=="
       }
     },
@@ -50,7 +55,12 @@
       "message": {
         "type": "sync_bindings",
         "protocol": 1,
-        "bindings": [{ "bindingId": "binding-1", "connector": "slack" }]
+        "bindings": [
+          {
+            "bindingId": "binding-1",
+            "connector": "slack"
+          }
+        ]
       }
     },
     {
@@ -60,8 +70,39 @@
         "protocol": 1,
         "requestId": "request-1",
         "status": 202,
-        "headers": { "x-result": "accepted" },
+        "headers": {
+          "x-result": "accepted"
+        },
         "body": "accepted"
+      }
+    },
+    {
+      "direction": "relayToLocal",
+      "message": {
+        "type": "webhook",
+        "protocol": 1,
+        "requestId": "request-2",
+        "bindingId": "binding-2",
+        "connector": "example",
+        "receivedAt": "2026-01-01T00:00:00.000Z",
+        "expiresAt": "2026-01-01T00:00:02.500Z",
+        "headers": {
+          "x-test": "1"
+        },
+        "rawBodyBase64": "eA=="
+      }
+    },
+    {
+      "direction": "localToRelay",
+      "message": {
+        "type": "sync_bindings",
+        "protocol": 1,
+        "bindings": [
+          {
+            "bindingId": "binding-2",
+            "connector": "example"
+          }
+        ]
       }
     }
   ],
@@ -79,12 +120,33 @@
     {
       "direction": "localToRelay",
       "errorCode": "unsupported_protocol",
-      "message": { "type": "sync_bindings", "protocol": 2, "bindings": [] }
+      "message": {
+        "type": "sync_bindings",
+        "protocol": 2,
+        "bindings": []
+      }
     },
     {
       "direction": "localToRelay",
       "errorCode": "invalid_message",
-      "message": { "type": "unknown", "protocol": 1 }
+      "message": {
+        "type": "unknown",
+        "protocol": 1
+      }
+    },
+    {
+      "direction": "localToRelay",
+      "errorCode": "invalid_message",
+      "message": {
+        "type": "sync_bindings",
+        "protocol": 1,
+        "bindings": [
+          {
+            "bindingId": "binding-3",
+            "connector": "Not/A Connector"
+          }
+        ]
+      }
     }
   ]
 }

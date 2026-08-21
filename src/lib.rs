@@ -35,7 +35,22 @@ use tokio::{
 use uuid::Uuid;
 
 pub const PROTOCOL: u8 = 1;
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
+
+/// The Relay routes by connector but never interprets one.
+///
+/// It does not verify provider signatures or read event bodies, so it has no use
+/// for the set of connector names in existence. Constraining the shape rather than
+/// the value keeps `/v1/webhooks/{connector}/{binding}` a safe route segment while
+/// letting the local installation add a provider without a Relay release.
+fn is_connector_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.starts_with(|c: char| c.is_ascii_lowercase())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
 const COMPONENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const OPEN_ENROLLMENT_MAX_INSTALLATIONS: i64 = 10_000;
 const OPEN_ENROLLMENT_INACTIVE_DAYS: i64 = 90;
@@ -666,7 +681,7 @@ async fn webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if connector != "linear" && connector != "slack" {
+    if !is_connector_id(&connector) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some(installation_id) = lookup_binding(&state, &binding_id, &connector) else {
@@ -762,7 +777,7 @@ fn replace_bindings(
         params![installation_id],
     )?;
     for binding in bindings {
-        if binding.connector == "linear" || binding.connector == "slack" {
+        if is_connector_id(&binding.connector) {
             tx.execute("INSERT INTO bindings (binding_id, connector, installation_id, updated_at) VALUES (?1, ?2, ?3, ?4)", params![binding.binding_id, binding.connector, installation_id, now()])?;
         }
     }
@@ -802,6 +817,11 @@ fn initialize_database(db: &Connection, config: &RelayConfig) -> Result<(), Rela
                         )?;
                     }
                 }
+                // Drop the connector allowlist. SQLite cannot remove a CHECK in
+                // place, so the table is rebuilt with the constraint omitted.
+                3 => tx.execute_batch(
+                    "CREATE TABLE bindings_next (binding_id TEXT PRIMARY KEY, connector TEXT NOT NULL, installation_id TEXT NOT NULL REFERENCES installations(installation_id) ON DELETE CASCADE, updated_at TEXT NOT NULL); INSERT INTO bindings_next SELECT binding_id, connector, installation_id, updated_at FROM bindings; DROP TABLE bindings; ALTER TABLE bindings_next RENAME TO bindings; CREATE INDEX bindings_installation_idx ON bindings(installation_id);",
+                )?,
                 _ => return Err(RelayError::MissingMigration(target)),
             }
             record_migration(&tx, target)?;
@@ -819,6 +839,9 @@ fn initialize_database(db: &Connection, config: &RelayConfig) -> Result<(), Rela
         }
         if source >= 2 {
             record_migration(&tx, 2)?;
+        }
+        if source >= 3 {
+            record_migration(&tx, 3)?;
         }
         tx.commit()?;
     }

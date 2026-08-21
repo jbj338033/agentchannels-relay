@@ -169,6 +169,48 @@ fn authenticated_installation_cannot_take_another_installations_binding() {
 }
 
 #[test]
+fn routes_any_well_formed_connector_and_rejects_malformed_ones() {
+    // The Relay does not interpret events, so it has no reason to know which
+    // providers exist. It constrains the shape of the route segment instead.
+    let state = state();
+    let key = SigningKey::generate(&mut OsRng);
+    state
+        .register_installation("install", key.verifying_key().as_bytes())
+        .unwrap();
+    replace_bindings(
+        &state,
+        "install",
+        vec![
+            Binding {
+                binding_id: "binding-discord".into(),
+                connector: "discord".into(),
+            },
+            Binding {
+                binding_id: "binding-bad".into(),
+                connector: "Not/A Connector".into(),
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        lookup_binding(&state, "binding-discord", "discord").as_deref(),
+        Some("install")
+    );
+    assert_eq!(
+        lookup_binding(&state, "binding-bad", "Not/A Connector"),
+        None
+    );
+
+    for value in ["slack", "linear", "discord", "ms-teams", "my_tool2"] {
+        assert!(is_connector_id(value), "{value} should be routable");
+    }
+    for value in ["", "Slack", "1slack", "sl ack", "sl/ack", &"a".repeat(33)] {
+        assert!(!is_connector_id(value), "{value:?} should be rejected");
+    }
+}
+
+#[test]
 fn webhook_body_is_not_persisted() {
     let state = state();
     let key = SigningKey::generate(&mut OsRng);
@@ -185,16 +227,18 @@ fn webhook_body_is_not_persisted() {
     )
     .unwrap();
     let db = state.db.lock().unwrap();
-    let tables: Vec<String> = db
+    // Ordered by creation, which a table rebuild changes; the set is the property.
+    let mut tables: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect();
+    tables.sort();
     assert_eq!(
         tables,
-        vec!["installations", "bindings", "schema_migrations"]
+        vec!["bindings", "installations", "schema_migrations"]
     );
     assert!(tables
         .iter()
