@@ -14,9 +14,15 @@ decisions, or verify provider signatures.
   persist or log webhook content.
 - SQLite stores installation Ed25519 public keys, Binding routing metadata, and
   timestamps only.
-- WebSocket authentication is an Ed25519 challenge/response. Keep protocol `1`,
-  camelCase wire fields, and the `linear`/`slack` connector allowlist stable.
-- Unknown connectors or Bindings return HTTP 404.
+- WebSocket authentication is an Ed25519 challenge/response. Keep protocol `1` and
+  camelCase wire fields stable.
+- A connector is an opaque routing key. Validate its shape
+  (`^[a-z][a-z0-9_-]{0,31}$`), never its value. This Relay does not interpret
+  events or verify provider signatures, so enumerating provider names constrains
+  the local installation without protecting anything here; the shape check is what
+  keeps the webhook path segment safe. Adding a provider must not require a Relay
+  release.
+- Malformed connectors or unknown Bindings return HTTP 404.
 - A known Binding with no active installation connection, or one that times out,
   returns HTTP 200 and drops the event; it must never become delayed work.
 - The default listener is loopback and the binary has no TLS. Public deployment
