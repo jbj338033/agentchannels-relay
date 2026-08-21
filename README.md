@@ -33,7 +33,7 @@ When binding beyond loopback, place the relay behind TLS, edge rate limiting, an
 
 - `POST /v1/installations` registers an installation ID and Ed25519 public key. Re-registering the same key is idempotent; a different key for the same ID returns `409 Conflict`.
 - `GET /v1/connect` upgrades to WebSocket and authenticates an installation with an Ed25519 challenge.
-- `POST /v1/webhooks/{connector}/{binding}` forwards a webhook through the stored Binding route. Only `linear` and `slack` connectors are accepted; unknown connectors or Bindings return `404 Not Found`.
+- `POST /v1/webhooks/{connector}/{binding}` forwards a webhook through the stored Binding route. The connector is an opaque routing key matching `^[a-z][a-z0-9_-]{0,31}$`; a malformed connector or an unknown Binding returns `404 Not Found`.
 
 For a known Binding, an offline installation or a response timeout returns `200 OK` and drops the event. Request headers and the base64-encoded raw body are forwarded in memory and webhook content is not persisted.
 
